@@ -54,6 +54,7 @@ type TeamStatic struct {
 
 type TeamMetrics struct {
 	Static              TeamStatic
+	TeamID              int
 	Form                []Match
 	FormScore           float64
 	GFAvg               float64
@@ -110,19 +111,49 @@ type FixtureInfo struct {
 	HasVenueGeo bool
 }
 
+type HeadToHeadSummary struct {
+	TotalMatches        int
+	HomeWins            int
+	AwayWins            int
+	Draws               int
+	HomeGoalsAverage    float64
+	AwayGoalsAverage    float64
+	WeightedHomeWinRate float64
+	WeightedAwayWinRate float64
+}
+
+type ScoringModifiers struct {
+	H2H                 HeadToHeadSummary
+	H2HHomeModifier     float64
+	H2HAwayModifier     float64
+	StakesHomeModifier  float64
+	StakesAwayModifier  float64
+	HomeStakesSituation string
+	AwayStakesSituation string
+	KeyFactors          []string
+	ExcludedFactors     []string
+}
+
 type Prediction struct {
-	HomeScore       float64
-	AwayScore       float64
-	HomeProb        float64
-	DrawProb        float64
-	AwayProb        float64
-	HomeGoals       int
-	AwayGoals       int
-	KeyFactors      []string
-	HomeModifier    float64
-	AwayModifier    float64
-	ExcludedFactors []string
-	LimitedData     bool
+	HomeScore           float64
+	AwayScore           float64
+	HomeProb            float64
+	DrawProb            float64
+	AwayProb            float64
+	HomeGoals           int
+	AwayGoals           int
+	KeyFactors          []string
+	HomeModifier        float64
+	AwayModifier        float64
+	H2H                 HeadToHeadSummary
+	H2HHomeModifier     float64
+	H2HAwayModifier     float64
+	StakesHomeModifier  float64
+	StakesAwayModifier  float64
+	HomeStakesSituation string
+	AwayStakesSituation string
+	ExcludedFactors     []string
+	LimitedData         bool
 }
 
 type apiTeamSearch struct {
@@ -184,6 +215,25 @@ type apiSquad struct {
 			Age      int    `json:"age"`
 			Position string `json:"position"`
 		} `json:"players"`
+	} `json:"response"`
+}
+
+type apiStandings struct {
+	Response []struct {
+		League struct {
+			Standings [][]struct {
+				Rank int `json:"rank"`
+				Team struct {
+					ID   int    `json:"id"`
+					Name string `json:"name"`
+				} `json:"team"`
+				Points int    `json:"points"`
+				Group  string `json:"group"`
+				All    struct {
+					Played int `json:"played"`
+				} `json:"all"`
+			} `json:"standings"`
+		} `json:"league"`
 	} `json:"response"`
 }
 
@@ -369,9 +419,10 @@ func runPrediction(ctx context.Context, client *http.Client, key string, home, a
 	homeMetrics, homeLimited := buildTeamMetrics(ctx, client, key, home)
 	awayMetrics, awayLimited := buildTeamMetrics(ctx, client, key, away)
 	weather, weatherLimited := fetchWeather(ctx, client, weatherLat, weatherLon)
+	modifiers := fetchScoringModifiers(ctx, client, key, homeMetrics, awayMetrics, stage)
 
-	prediction := predict(homeMetrics, awayMetrics, weather, stage, homeRest, awayRest)
-	prediction.LimitedData = homeLimited || awayLimited || weatherLimited
+	prediction := predict(homeMetrics, awayMetrics, weather, stage, homeRest, awayRest, modifiers)
+	prediction.LimitedData = homeLimited || awayLimited || weatherLimited || len(modifiers.ExcludedFactors) > 0
 
 	printReport(homeMetrics, awayMetrics, weather, prediction, stage, homeRest, awayRest)
 }
@@ -459,11 +510,19 @@ func fixtureFromAPI(item struct {
 }
 
 func printFixtures(fixtures []FixtureInfo, grouped bool) {
+	central, err := time.LoadLocation("America/Chicago")
+	if err != nil {
+		central = time.UTC
+	}
+
 	currentDate := ""
 	for i, f := range fixtures {
 		dateGroup := "TBD"
+		timeOfDay := "TBD"
 		if !f.Date.IsZero() {
-			dateGroup = f.Date.Format("2006-01-02")
+			centralKickoff := f.Date.In(central)
+			dateGroup = centralKickoff.Format("2006-01-02")
+			timeOfDay = centralKickoff.Format("15:04 MST")
 		}
 		if dateGroup != currentDate {
 			currentDate = dateGroup
@@ -472,10 +531,6 @@ func printFixtures(fixtures []FixtureInfo, grouped bool) {
 			fmt.Println(strings.Repeat("-", len(currentDate)))
 		}
 
-		timeOfDay := "TBD"
-		if !f.Date.IsZero() {
-			timeOfDay = f.Date.Format("15:04 MST")
-		}
 		venue := strings.TrimSpace(f.VenueName)
 		if venue == "" {
 			venue = "TBD venue"
@@ -599,6 +654,7 @@ func buildTeamMetrics(ctx context.Context, client *http.Client, key string, stat
 		m.ExcludedFactors = append(m.ExcludedFactors, "live team lookup")
 		return m, true
 	}
+	m.TeamID = teamID
 
 	limited := false
 	if fixtures, err := fetchFixtures(ctx, client, key, teamID); err == nil && len(fixtures) > 0 {
@@ -626,6 +682,281 @@ func buildTeamMetrics(ctx context.Context, client *http.Client, key string, stat
 	m.RecentResultsString = formString(m.Form)
 	m.DataCompleteness = dataCompleteness(m)
 	return m, limited
+}
+
+func fetchScoringModifiers(ctx context.Context, client *http.Client, key string, home, away TeamMetrics, stage string) ScoringModifiers {
+	var modifiers ScoringModifiers
+	if home.TeamID == 0 || away.TeamID == 0 {
+		modifiers.ExcludedFactors = append(modifiers.ExcludedFactors, "head-to-head history (team IDs unavailable)")
+	} else {
+		h2h, factors, homeMod, awayMod, err := fetchHeadToHead(ctx, client, key, home.TeamID, away.TeamID, home.Static.Name, away.Static.Name)
+		if err != nil {
+			modifiers.ExcludedFactors = append(modifiers.ExcludedFactors, "head-to-head history")
+		} else {
+			modifiers.H2H = h2h
+			modifiers.H2HHomeModifier = homeMod
+			modifiers.H2HAwayModifier = awayMod
+			modifiers.KeyFactors = append(modifiers.KeyFactors, factors...)
+			if h2h.TotalMatches == 0 {
+				modifiers.ExcludedFactors = append(modifiers.ExcludedFactors, "head-to-head modifier (no prior meetings)")
+			}
+		}
+	}
+
+	if isKnockout(stage) {
+		modifiers.KeyFactors = append(modifiers.KeyFactors, "Knockout stage - elimination stakes apply equally")
+		return modifiers
+	}
+	if home.TeamID == 0 || away.TeamID == 0 {
+		modifiers.ExcludedFactors = append(modifiers.ExcludedFactors, "group-stage stakes (team IDs unavailable)")
+		return modifiers
+	}
+
+	homeSituation, awaySituation, homeMod, awayMod, factors, err := fetchGroupStakes(ctx, client, key, home.TeamID, away.TeamID, home.Static.Name, away.Static.Name)
+	if err != nil {
+		modifiers.ExcludedFactors = append(modifiers.ExcludedFactors, "group-stage stakes")
+		return modifiers
+	}
+	modifiers.HomeStakesSituation = homeSituation
+	modifiers.AwayStakesSituation = awaySituation
+	modifiers.StakesHomeModifier = homeMod
+	modifiers.StakesAwayModifier = awayMod
+	modifiers.KeyFactors = append(modifiers.KeyFactors, factors...)
+	return modifiers
+}
+
+func fetchHeadToHead(ctx context.Context, client *http.Client, key string, homeID, awayID int, homeName, awayName string) (HeadToHeadSummary, []string, float64, float64, error) {
+	var parsed apiFixtures
+	endpoint := fmt.Sprintf("%sfixtures/headtohead?h2h=%d-%d", apiBase, homeID, awayID)
+	if err := getJSON(ctx, client, key, endpoint, &parsed); err != nil {
+		return HeadToHeadSummary{}, nil, 0, 0, err
+	}
+
+	sort.Slice(parsed.Response, func(i, j int) bool {
+		left, _ := time.Parse(time.RFC3339, parsed.Response[i].Fixture.Date)
+		right, _ := time.Parse(time.RFC3339, parsed.Response[j].Fixture.Date)
+		return left.After(right)
+	})
+
+	var summary HeadToHeadSummary
+	var homeGoals, awayGoals, weightedHomeWins, weightedAwayWins, weightedTotal float64
+	var recentHomeWins, recentAwayWins, recentDraws, recentCount int
+	cutoff := time.Now().AddDate(-3, 0, 0)
+	for _, fixture := range parsed.Response {
+		if fixture.Goals.Home == nil || fixture.Goals.Away == nil {
+			continue
+		}
+		playedAt, err := time.Parse(time.RFC3339, fixture.Fixture.Date)
+		if err != nil || playedAt.After(time.Now()) {
+			continue
+		}
+		weight := 1.0
+		if playedAt.After(cutoff) {
+			weight = 2.0
+		}
+		weightedTotal += weight
+		summary.TotalMatches++
+
+		forHome, forAway := *fixture.Goals.Home, *fixture.Goals.Away
+		homeWasAPIHome := fixture.Teams.Home.ID == homeID
+		if !homeWasAPIHome {
+			forHome, forAway = forAway, forHome
+		}
+		homeGoals += float64(forHome)
+		awayGoals += float64(forAway)
+		switch {
+		case forHome > forAway:
+			summary.HomeWins++
+			weightedHomeWins += weight
+			if recentCount < 5 {
+				recentHomeWins++
+			}
+		case forAway > forHome:
+			summary.AwayWins++
+			weightedAwayWins += weight
+			if recentCount < 5 {
+				recentAwayWins++
+			}
+		default:
+			summary.Draws++
+			if recentCount < 5 {
+				recentDraws++
+			}
+		}
+		if recentCount < 5 {
+			recentCount++
+		}
+	}
+
+	if summary.TotalMatches == 0 {
+		return summary, []string{"First-ever meeting between these sides"}, 0, 0, nil
+	}
+	summary.HomeGoalsAverage = homeGoals / float64(summary.TotalMatches)
+	summary.AwayGoalsAverage = awayGoals / float64(summary.TotalMatches)
+	if weightedTotal > 0 {
+		summary.WeightedHomeWinRate = weightedHomeWins / weightedTotal
+		summary.WeightedAwayWinRate = weightedAwayWins / weightedTotal
+	}
+
+	homeMod, awayMod := 0.0, 0.0
+	if math.Abs(summary.WeightedHomeWinRate-summary.WeightedAwayWinRate) > .10 {
+		if summary.WeightedHomeWinRate >= .60 {
+			homeMod = 3
+		} else if summary.WeightedAwayWinRate >= .60 {
+			awayMod = 3
+		}
+	}
+
+	factor := fmt.Sprintf("Head-to-head: %s %d wins, %s %d wins, %d draws", homeName, summary.HomeWins, awayName, summary.AwayWins, summary.Draws)
+	if recentCount > 0 {
+		switch {
+		case recentHomeWins > recentAwayWins:
+			factor = fmt.Sprintf("%s has won %d of the last %d meetings with this opponent", homeName, recentHomeWins, recentCount)
+		case recentAwayWins > recentHomeWins:
+			factor = fmt.Sprintf("%s has won %d of the last %d meetings with this opponent", awayName, recentAwayWins, recentCount)
+		default:
+			factor = fmt.Sprintf("Recent head-to-head is balanced across the last %d meetings (%d draws)", recentCount, recentDraws)
+		}
+	}
+	return summary, []string{factor}, homeMod, awayMod, nil
+}
+
+type standingsEntry struct {
+	TeamID int
+	Rank   int
+	Points int
+	Played int
+	Group  string
+}
+
+func fetchGroupStakes(ctx context.Context, client *http.Client, key string, homeID, awayID int, homeName, awayName string) (string, string, float64, float64, []string, error) {
+	var parsed apiStandings
+	endpoint := fmt.Sprintf("%sstandings?league=%d&season=%d", apiBase, worldCupLeagueID, worldCupSeason)
+	if err := getJSON(ctx, client, key, endpoint, &parsed); err != nil {
+		return "", "", 0, 0, nil, err
+	}
+	if len(parsed.Response) == 0 {
+		return "", "", 0, 0, nil, errors.New("empty standings response")
+	}
+
+	var group []standingsEntry
+	for _, table := range parsed.Response[0].League.Standings {
+		containsHome, containsAway := false, false
+		entries := make([]standingsEntry, 0, len(table))
+		for _, row := range table {
+			entry := standingsEntry{TeamID: row.Team.ID, Rank: row.Rank, Points: row.Points, Played: row.All.Played, Group: row.Group}
+			entries = append(entries, entry)
+			containsHome = containsHome || row.Team.ID == homeID
+			containsAway = containsAway || row.Team.ID == awayID
+		}
+		if containsHome && containsAway {
+			group = entries
+			break
+		}
+	}
+	if len(group) == 0 {
+		return "", "", 0, 0, nil, errors.New("teams not found in the same group standings")
+	}
+
+	homeEntry, homeFound := findStanding(group, homeID)
+	awayEntry, awayFound := findStanding(group, awayID)
+	if !homeFound || !awayFound {
+		return "", "", 0, 0, nil, errors.New("team standings unavailable")
+	}
+	homeSituation := classifyStakes(homeEntry, group)
+	awaySituation := classifyStakes(awayEntry, group)
+	homeMod := stakesModifier(homeSituation)
+	awayMod := stakesModifier(awaySituation)
+	factors := stakesFactors(homeName, awayName, homeSituation, awaySituation)
+	return homeSituation, awaySituation, homeMod, awayMod, factors, nil
+}
+
+func findStanding(group []standingsEntry, teamID int) (standingsEntry, bool) {
+	for _, entry := range group {
+		if entry.TeamID == teamID {
+			return entry, true
+		}
+	}
+	return standingsEntry{}, false
+}
+
+func classifyStakes(team standingsEntry, group []standingsEntry) string {
+	second, hasSecond := standingAtRank(group, 2)
+	third, hasThird := standingAtRank(group, 3)
+	remaining := clampInt(3-team.Played, 0, 3)
+	if team.Rank <= 2 && hasThird {
+		thirdRemaining := clampInt(3-third.Played, 0, 3)
+		if team.Points > third.Points+thirdRemaining*3 {
+			return "qualified"
+		}
+	}
+	if team.Rank >= 3 && hasSecond && team.Points+remaining*3 < second.Points {
+		return "eliminated"
+	}
+	if team.Rank == 2 || team.Rank == 3 {
+		return "fighting"
+	}
+	return "contending"
+}
+
+func standingAtRank(group []standingsEntry, rank int) (standingsEntry, bool) {
+	for _, entry := range group {
+		if entry.Rank == rank {
+			return entry, true
+		}
+	}
+	return standingsEntry{}, false
+}
+
+func stakesModifier(situation string) float64 {
+	switch situation {
+	case "qualified":
+		return -3
+	case "fighting":
+		return 5
+	case "eliminated":
+		return -5
+	default:
+		return 0
+	}
+}
+
+func stakesFactors(homeName, awayName, homeSituation, awaySituation string) []string {
+	homeSettled := homeSituation == "qualified" || homeSituation == "eliminated"
+	awaySettled := awaySituation == "qualified" || awaySituation == "eliminated"
+	if homeSituation == "qualified" && awaySituation == "qualified" {
+		return []string{"Both teams already through - expect rotation and reduced intensity"}
+	}
+	if homeSettled && awaySettled {
+		return []string{"Both teams' group fates are settled - dead-rubber intensity expected"}
+	}
+	var factors []string
+	appendSituation := func(name, situation string) {
+		switch situation {
+		case "fighting":
+			factors = append(factors, fmt.Sprintf("%s needs a result to stay in qualification contention - desperation boost applied", name))
+		case "qualified":
+			factors = append(factors, fmt.Sprintf("%s is already qualified - rotation risk reduces motivation", name))
+		case "eliminated":
+			factors = append(factors, fmt.Sprintf("%s is already eliminated - motivation penalty applied", name))
+		}
+	}
+	appendSituation(homeName, homeSituation)
+	appendSituation(awayName, awaySituation)
+	return factors
+}
+
+func mergeKeyFactors(priority, existing []string) []string {
+	factors := make([]string, 0, 8)
+	for _, group := range [][]string{priority, existing} {
+		for _, factor := range group {
+			if factor == "" || len(factors) >= 8 {
+				continue
+			}
+			factors = append(factors, factor)
+		}
+	}
+	return factors
 }
 
 func fetchTeamID(ctx context.Context, client *http.Client, key, name string) (int, error) {
@@ -707,37 +1038,61 @@ func fetchSquad(ctx context.Context, client *http.Client, key string, teamID int
 func getJSON(ctx context.Context, client *http.Client, key, url string, target any) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
+		debugEndpointFailure(url, err.Error())
 		return err
 	}
 	req.Header.Set("x-apisports-key", key)
 	resp, err := client.Do(req)
 	if err != nil {
+		debugEndpointFailure(url, err.Error())
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		io.Copy(io.Discard, resp.Body)
+		detail := responseErrorDetail(resp)
+		debugEndpointFailure(url, detail)
 		return fmt.Errorf("api status %d", resp.StatusCode)
 	}
-	return json.NewDecoder(resp.Body).Decode(target)
+	if err := json.NewDecoder(resp.Body).Decode(target); err != nil {
+		debugEndpointFailure(url, err.Error())
+		return err
+	}
+	return nil
+}
+
+func debugEndpointFailure(url, details string) {
+	fmt.Fprintf(os.Stderr, "[DEBUG] Endpoint failed: %s | Error: %s\n", url, details)
+}
+
+func responseErrorDetail(resp *http.Response) string {
+	detail := fmt.Sprintf("HTTP %d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 2048))
+	if err == nil && strings.TrimSpace(string(body)) != "" {
+		detail += ": " + strings.TrimSpace(string(body))
+	}
+	return detail
 }
 
 func fetchWeather(ctx context.Context, client *http.Client, lat, lon float64) (Weather, bool) {
 	url := fmt.Sprintf("%s?latitude=%.4f&longitude=%.4f&current=temperature_2m,rain,wind_speed_10m,relative_humidity_2m&wind_speed_unit=kmh", weatherBase, lat, lon)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
+		debugEndpointFailure(url, err.Error())
 		return fallbackWeather(), true
 	}
 	resp, err := client.Do(req)
 	if err != nil {
+		debugEndpointFailure(url, err.Error())
 		return fallbackWeather(), true
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		debugEndpointFailure(url, responseErrorDetail(resp))
 		return fallbackWeather(), true
 	}
 	var parsed openMeteo
 	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		debugEndpointFailure(url, err.Error())
 		return fallbackWeather(), true
 	}
 	w := Weather{
@@ -754,7 +1109,7 @@ func fallbackWeather() Weather {
 	return Weather{TempC: 22, RainMM: 0, WindKMH: 10, HumidityPct: 55, Summary: "mild fallback weather"}
 }
 
-func predict(home, away TeamMetrics, weather Weather, stage string, homeRest, awayRest int) Prediction {
+func predict(home, away TeamMetrics, weather Weather, stage string, homeRest, awayRest int, modifiers ScoringModifiers) Prediction {
 	homeBase := weightedScore(home)
 	awayBase := weightedScore(away)
 
@@ -764,8 +1119,8 @@ func predict(home, away TeamMetrics, weather Weather, stage string, homeRest, aw
 		homeBase *= stageMult
 		awayBase *= stageMult
 	}
-	homeScore := homeBase + homeMod
-	awayScore := awayBase + awayMod
+	homeScore := homeBase + homeMod + modifiers.H2HHomeModifier + modifiers.StakesHomeModifier
+	awayScore := awayBase + awayMod + modifiers.H2HAwayModifier + modifiers.StakesAwayModifier
 	matchupAdjust(&homeScore, &awayScore, home, away)
 
 	diff := clamp(homeScore-awayScore, -45, 45)
@@ -785,17 +1140,24 @@ func predict(home, away TeamMetrics, weather Weather, stage string, homeRest, aw
 
 	hg, ag := scoreline(home, away, stage, homeScore, awayScore)
 	return Prediction{
-		HomeScore:       homeScore,
-		AwayScore:       awayScore,
-		HomeProb:        homeWin,
-		DrawProb:        draw,
-		AwayProb:        awayWin,
-		HomeGoals:       hg,
-		AwayGoals:       ag,
-		KeyFactors:      keyFactors(home, away, weather, stage, homeMod, awayMod),
-		HomeModifier:    homeMod,
-		AwayModifier:    awayMod,
-		ExcludedFactors: append(home.ExcludedFactors, away.ExcludedFactors...),
+		HomeScore:           homeScore,
+		AwayScore:           awayScore,
+		HomeProb:            homeWin,
+		DrawProb:            draw,
+		AwayProb:            awayWin,
+		HomeGoals:           hg,
+		AwayGoals:           ag,
+		KeyFactors:          mergeKeyFactors(modifiers.KeyFactors, keyFactors(home, away, weather, stage, homeMod, awayMod)),
+		HomeModifier:        homeMod,
+		AwayModifier:        awayMod,
+		H2H:                 modifiers.H2H,
+		H2HHomeModifier:     modifiers.H2HHomeModifier,
+		H2HAwayModifier:     modifiers.H2HAwayModifier,
+		StakesHomeModifier:  modifiers.StakesHomeModifier,
+		StakesAwayModifier:  modifiers.StakesAwayModifier,
+		HomeStakesSituation: modifiers.HomeStakesSituation,
+		AwayStakesSituation: modifiers.AwayStakesSituation,
+		ExcludedFactors:     append(append(home.ExcludedFactors, away.ExcludedFactors...), modifiers.ExcludedFactors...),
 	}
 }
 
